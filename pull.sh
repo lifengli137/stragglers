@@ -6,7 +6,7 @@ done
 while :
 do
 	for i in $nodes; do 
-		scp -r $i:/tmp/stragglers/* ./$i/ > /dev/null 2>&1
+		scp -r $i:/dev/shm/stragglers/* ./$i/ > /dev/null 2>&1
 	done
     clear
     python stragglers.py
