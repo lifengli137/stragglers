@@ -330,11 +330,17 @@ class SFMPipeEngine(DeepSpeedEngine):
         self.per_iter_lmb_cpu_time = 0.0
 
         self.time_id_fp = 0         # Forward Pass
+        self.cpu_time_start_fp = 0
+        self.cpu_time_end_fp = 0
+        self.per_iter_fp_cpu_time = 0.0
         self.gpu_time_start_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.gpu_time_end_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.per_iter_fp_gpu_time = 0.0
 
         self.time_id_bp = 0         # Backard Pass
+        self.cpu_time_start_bp = 0
+        self.cpu_time_end_bp = 0
+        self.per_iter_bp_cpu_time = 0.0
         self.gpu_time_start_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.gpu_time_end_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.per_iter_bp_gpu_time = 0.0
@@ -351,18 +357,16 @@ class SFMPipeEngine(DeepSpeedEngine):
         self.cpu_time_start_ra = 0
         self.cpu_time_end_ra = 0
         self.per_iter_ra_cpu_time = 0.0
-
-        self.gpu_time_start_ra = torch.cuda.Event(enable_timing=True)
-        self.gpu_time_end_ra = torch.cuda.Event(enable_timing=True)
+        self.gpu_time_start_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        self.gpu_time_end_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.per_iter_ra_gpu_time = 0.0
 
         self.time_id_sa = 0         # Send Activation
         self.cpu_time_start_sa = 0
         self.cpu_time_end_sa = 0
         self.per_iter_sa_cpu_time = 0.0
-
-        self.gpu_time_start_sa = torch.cuda.Event(enable_timing=True)
-        self.gpu_time_end_sa = torch.cuda.Event(enable_timing=True)
+        self.gpu_time_start_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        self.gpu_time_end_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.per_iter_sa_gpu_time = 0.0
 
         self.time_id_rg = 0         # Recv Gradient
@@ -378,12 +382,14 @@ class SFMPipeEngine(DeepSpeedEngine):
         self.cpu_time_start_sg = 0
         self.cpu_time_end_sg = 0
         self.per_iter_sg_cpu_time = 0.0
-
-        self.gpu_time_start_sg = torch.cuda.Event(enable_timing=True)
-        self.gpu_time_end_sg = torch.cuda.Event(enable_timing=True)
+        self.gpu_time_start_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        self.gpu_time_end_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
         self.per_iter_sg_gpu_time = 0.0
 
         # Optimizer Step
+        self.cpu_time_start_os = 0
+        self.cpu_time_end_os = 0
+        self.per_iter_os_cpu_time = 0.0
         self.gpu_time_start_os = torch.cuda.Event(enable_timing=True)
         self.gpu_time_end_os = torch.cuda.Event(enable_timing=True)
         self.per_iter_os_gpu_time = 0.0
@@ -437,7 +443,8 @@ class SFMPipeEngine(DeepSpeedEngine):
             dist.all_reduce(grad, group=group)
 
     def _exec_reduce_grads(self):
-
+        
+        self.cpu_time_start_ag = time.perf_counter()
         self.gpu_time_start_ag.record()
 
         self._force_grad_boundary = True
@@ -450,6 +457,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         self._force_grad_boundary = False
 
         self.gpu_time_end_ag.record()
+        self.cpu_time_end_ag = time.perf_counter()
 
     def _bf16_reduce_grads(self):
         # Make our own list of gradients from the optimizer's FP32 grads
@@ -604,27 +612,37 @@ class SFMPipeEngine(DeepSpeedEngine):
 
         per_iter_avg_lmb_cpu_time = 0 if self.time_id_lmb == 0 else 1000 * self.per_iter_lmb_cpu_time/self.time_id_lmb
 
-
+        per_iter_avg_fp_cpu_time = 0 if self.time_id_fp == 0 else  1000 * self.per_iter_fp_cpu_time/self.time_id_fp
         self.per_iter_fp_gpu_time = [self.gpu_time_start_fp[i].elapsed_time(self.gpu_time_end_fp[i]) for i in range(self.time_id_fp)] 
-        per_iter_avg_fp_gpu_time = sum(self.per_iter_fp_gpu_time)/self.time_id_fp
+        per_iter_avg_fp_gpu_time = 0 if self.time_id_fp == 0 else sum(self.per_iter_fp_gpu_time)/self.time_id_fp
 
+        per_iter_avg_bp_cpu_time = 0 if self.time_id_bp == 0 else  1000 * self.per_iter_bp_cpu_time/self.time_id_bp
         self.per_iter_bp_gpu_time = [self.gpu_time_start_bp[i].elapsed_time(self.gpu_time_end_bp[i]) for i in range(self.time_id_bp)] 
-        per_iter_avg_bp_gpu_time = sum(self.per_iter_bp_gpu_time)/self.time_id_bp
+        per_iter_avg_bp_gpu_time = 0 if self.time_id_bp == 0 else sum(self.per_iter_bp_gpu_time)/self.time_id_bp
 
         per_iter_avg_ra_cpu_time = 0 if self.time_id_ra == 0 else  1000 * self.per_iter_ra_cpu_time/self.time_id_ra
-        per_iter_avg_sa_cpu_time = 0 if self.time_id_sa == 0 else  1000 * self.per_iter_sa_cpu_time/self.time_id_sa
-        per_iter_avg_rg_cpu_time = 0 if self.time_id_rg == 0 else  1000 * self.per_iter_rg_cpu_time/self.time_id_rg
+        self.per_iter_ra_gpu_time = [self.gpu_time_start_ra[i].elapsed_time(self.gpu_time_end_ra[i]) for i in range(self.time_id_ra)] 
+        per_iter_avg_ra_gpu_time = 0 if self.time_id_ra == 0 else sum(self.per_iter_ra_gpu_time)/self.time_id_ra
 
+        per_iter_avg_sa_cpu_time = 0 if self.time_id_sa == 0 else  1000 * self.per_iter_sa_cpu_time/self.time_id_sa
+        self.per_iter_sa_gpu_time = [self.gpu_time_start_sa[i].elapsed_time(self.gpu_time_end_sa[i]) for i in range(self.time_id_sa)] 
+        per_iter_avg_sa_gpu_time = 0 if self.time_id_sa == 0 else sum(self.per_iter_sa_gpu_time)/self.time_id_sa
+        
+        per_iter_avg_rg_cpu_time = 0 if self.time_id_rg == 0 else  1000 * self.per_iter_rg_cpu_time/self.time_id_rg
         self.per_iter_rg_gpu_time = [self.gpu_time_start_rg[i].elapsed_time(self.gpu_time_end_rg[i]) for i in range(self.time_id_rg)] 
         per_iter_avg_rg_gpu_time = 0 if self.time_id_rg == 0 else sum(self.per_iter_rg_gpu_time)/self.time_id_rg
 
         per_iter_avg_sg_cpu_time = 0 if self.time_id_sg == 0 else  1000 * self.per_iter_sg_cpu_time/self.time_id_sg
+        self.per_iter_sg_gpu_time = [self.gpu_time_start_sg[i].elapsed_time(self.gpu_time_end_sg[i]) for i in range(self.time_id_sg)] 
+        per_iter_avg_sg_gpu_time = 0 if self.time_id_sg == 0 else sum(self.per_iter_sg_gpu_time)/self.time_id_sg
 
+        per_iter_ag_cpu_time = 1000 * (self.cpu_time_end_ag - self.cpu_time_start_ag)
         per_iter_ag_gpu_time = self.gpu_time_start_ag.elapsed_time(self.gpu_time_end_ag)
 
+        per_iter_os_cpu_time = 1000 * (self.cpu_time_end_os - self.cpu_time_start_os)
         per_iter_os_gpu_time = self.gpu_time_start_os.elapsed_time(self.gpu_time_end_os)
 
-        strWritten = f"Step:{self.global_steps} LMB:{per_iter_avg_lmb_cpu_time:.2f} RA:{per_iter_avg_ra_cpu_time:.2f} FP:{per_iter_avg_fp_gpu_time:.2f} SA:{per_iter_avg_sa_cpu_time:.2f} RG:{per_iter_avg_rg_cpu_time:.2f} RG:{per_iter_avg_rg_gpu_time:.2f} BP:{per_iter_avg_bp_gpu_time:.2f} SG:{per_iter_avg_sg_cpu_time:.2f} AG:{per_iter_ag_gpu_time:.2f} OS:{per_iter_os_gpu_time:.2f} \n"
+        strWritten = f"Step:{self.global_steps} LMB:{per_iter_avg_lmb_cpu_time:.2f} RA-c:{per_iter_avg_ra_cpu_time:.2f} RA-g:{per_iter_avg_ra_gpu_time:.2f} FP-c:{per_iter_avg_fp_cpu_time:.2f} FP-g:{per_iter_avg_fp_gpu_time:.2f} SA-c:{per_iter_avg_sa_cpu_time:.2f} SA-g:{per_iter_avg_sa_gpu_time:.2f} RG-c:{per_iter_avg_rg_cpu_time:.2f} RG-g:{per_iter_avg_rg_gpu_time:.2f} BP-c:{per_iter_avg_bp_cpu_time:.2f} BP-g:{per_iter_avg_bp_gpu_time:.2f} SG-c:{per_iter_avg_sg_cpu_time:.2f} SG-g:{per_iter_avg_sg_gpu_time:.2f} AG-c:{per_iter_ag_cpu_time:.2f} AG-g:{per_iter_ag_gpu_time:.2f} OS-c:{per_iter_os_cpu_time:.2f} OS-g:{per_iter_os_gpu_time:.2f} \n"
         
         #print(strWritten)
         self.file.write(strWritten)
@@ -632,12 +650,18 @@ class SFMPipeEngine(DeepSpeedEngine):
 
 
         self.per_iter_lmb_cpu_time = 0.0
+        self.per_iter_fp_cpu_time = 0.0
         self.per_iter_fp_gpu_time = 0.0
+        self.per_iter_bp_cpu_time = 0.0
         self.per_iter_bp_gpu_time = 0.0
         self.per_iter_ra_cpu_time = 0.0
+        self.per_iter_ra_gpu_time = 0.0
         self.per_iter_sa_cpu_time = 0.0
+        self.per_iter_sa_gpu_time = 0.0
         self.per_iter_rg_cpu_time = 0.0
+        self.per_iter_rg_gpu_time = 0.0
         self.per_iter_sg_cpu_time = 0.0
+        self.per_iter_sa_gpu_time = 0.0
 
         self.time_id_lmb = 0
         self.time_id_fp = 0
@@ -988,10 +1012,13 @@ class SFMPipeEngine(DeepSpeedEngine):
         # # tensor changes across batches
         # self._zero_grads(inputs)
 
-
+        self.cpu_time_start_fp = time.perf_counter()
         self.gpu_time_start_fp[self.time_id_fp].record()
         outputs = super().forward(inputs)
         self.gpu_time_end_fp[self.time_id_fp].record()
+        self.cpu_time_end_fp = time.perf_counter()
+        self.per_iter_fp_cpu_time += self.cpu_time_end_fp - self.cpu_time_start_fp
+
         self.time_id_fp += 1
         
 
@@ -1087,10 +1114,13 @@ class SFMPipeEngine(DeepSpeedEngine):
 
 
         if self.is_last_stage():
-
+            
+            self.cpu_time_start_bp = time.perf_counter()
             self.gpu_time_start_bp[self.time_id_bp].record()
             super().backward(self.loss)
             self.gpu_time_end_bp[self.time_id_bp].record()
+            self.cpu_time_end_bp = time.perf_counter()
+            self.per_iter_bp_cpu_time += self.cpu_time_end_bp - self.cpu_time_start_bp
             self.time_id_bp += 1
 
             self.mem_status("AFTER BWD")
@@ -1140,6 +1170,7 @@ class SFMPipeEngine(DeepSpeedEngine):
             # manually call because we don't call optimizer.backward()
             self.optimizer.clear_lp_grads()
 
+        self.cpu_time_start_bp = time.perf_counter()
         self.gpu_time_start_bp[self.time_id_bp].record()
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
@@ -1155,6 +1186,8 @@ class SFMPipeEngine(DeepSpeedEngine):
             torch.autograd.backward(tensors=(outputs,), grad_tensors=(grad_tensors,))
         
         self.gpu_time_end_bp[self.time_id_bp].record()
+        self.cpu_time_end_bp = time.perf_counter()
+        self.per_iter_bp_cpu_time += self.cpu_time_end_bp - self.cpu_time_start_bp
 
         self.time_id_bp += 1
 
@@ -1378,6 +1411,7 @@ class SFMPipeEngine(DeepSpeedEngine):
 
     def _exec_send_activations(self, buffer_id):
         self.cpu_time_start_sa = time.perf_counter()
+        self.gpu_time_start_sa[self.time_id_sa].record()
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).start()
@@ -1416,6 +1450,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).stop()
 
+        self.gpu_time_end_sa[self.time_id_sa].record()
         self.cpu_time_end_sa = time.perf_counter()
         self.per_iter_sa_cpu_time += self.cpu_time_end_sa - self.cpu_time_start_sa
         self.time_id_sa += 1
@@ -1423,6 +1458,7 @@ class SFMPipeEngine(DeepSpeedEngine):
     def _exec_send_grads(self, buffer_id):
 
         self.cpu_time_start_sg = time.perf_counter()
+        self.gpu_time_start_sg[self.time_id_sg].record()
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).start()
 
@@ -1481,7 +1517,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).stop()
 
-
+        self.gpu_time_end_sg[self.time_id_sg].record()
         self.cpu_time_end_sg = time.perf_counter()
         self.per_iter_sg_cpu_time += self.cpu_time_end_sg - self.cpu_time_start_sg
         self.time_id_sg += 1
@@ -1489,7 +1525,7 @@ class SFMPipeEngine(DeepSpeedEngine):
     def _exec_recv_activations(self, buffer_id):
 
         self.cpu_time_start_ra = time.perf_counter()
-
+        self.gpu_time_start_ra[self.time_id_ra].record()
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).start()
 
@@ -1536,7 +1572,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
 
-
+        self.gpu_time_end_ra[self.time_id_ra].record()
         self.cpu_time_end_ra = time.perf_counter()
         self.per_iter_ra_cpu_time += self.cpu_time_end_ra - self.cpu_time_start_ra
         self.time_id_ra += 1
@@ -1631,13 +1667,15 @@ class SFMPipeEngine(DeepSpeedEngine):
             self.timers(STEP_MICRO_TIMER).start()
             self.timers(STEP_GLOBAL_TIMER).start()
         self.mem_status("BEFORE STEP", reset_max=True)
-
+        
+        self.cpu_time_start_os = time.perf_counter()
         self.gpu_time_start_os.record()
         self._force_grad_boundary = True
         self._take_model_step(lr_kwargs)
         self._force_grad_boundary = False
         self.gpu_time_end_os.record()
-
+        self.cpu_time_end_os = time.perf_counter()
+        
         self.mem_status("AFTER STEP")
 
         if self.global_rank == 0 and self.monitor.enabled:
