@@ -93,6 +93,19 @@ class SFMPipeEngine(DeepSpeedEngine):
     ]
     DTYPE_TO_ID = {dtype: id_ for id_, dtype in enumerate(ID_TO_DTYPE)}
 
+    _CMD_MAP = {
+        schedule.OptimizerStep: "OS",
+        schedule.ReduceGrads: "AG",
+        schedule.ReduceTiedGrads: "AT",
+        schedule.LoadMicroBatch: "LB",
+        schedule.ForwardPass: "FP",
+        schedule.BackwardPass: "BP",
+        schedule.SendActivation: "SA",
+        schedule.RecvActivation: "RA",
+        schedule.SendGrad: "SG",
+        schedule.RecvGrad: "RG",
+    }
+
     def __init__(
         self,
         has_bool_tensors=False,
@@ -322,77 +335,122 @@ class SFMPipeEngine(DeepSpeedEngine):
         file_name = f"/dev/shm/stragglers/{cudaDeviceId}_{self.grid.get_stage_id()}_{self.grid.get_slice_parallel_rank()}_{self.grid.data_parallel_id}.txt"
         os.makedirs(os.path.dirname(file_name), exist_ok=True)
         self.file = open(file_name, 'a')
+
+
+        # Find the phase that has the max number of operations, for alignment
+        max_ops_per_phase = 0 
+        for i in range(self.num_stages):
+            pipe_schedule = schedule.TrainSchedule(
+                micro_batches=self.micro_batches,
+                stages=self.num_stages,
+                stage_id=i,
+            )
+            for step_cmds in pipe_schedule:
+                if len(step_cmds) > max_ops_per_phase:
+                    max_ops_per_phase = len(step_cmds)
+
+        pipe_schedule = schedule.TrainSchedule(
+            micro_batches=self.micro_batches,
+            stages=self.num_stages,
+            stage_id=self.stage_id,
+        )
+
+        self.phase = []
+        for step_cmds in pipe_schedule:            
+            for cmd in step_cmds:
+                self.phase.append(self._CMD_MAP[type(cmd)])
+            for i in range(max_ops_per_phase - len(step_cmds)):
+                self.phase.append("--")
+        
+        phase_str = ' '.join(self.phase)
+        strWritten = f"Steps {phase_str}\n"
+        self.file.write(strWritten)
+
+        #print("Local rank: " + str(self.local_rank) + " " + str(phase))
+
+
+        # import pdb
+        # if self.local_rank == 0:
+        #     pdb.set_trace()
     
-        
-        self.time_id_lmb = 0        # Load Micro Batch
-        self.cpu_time_start_lmb = 0
-        self.cpu_time_end_lmb = 0
-        self.per_iter_lmb_cpu_time = 0.0
-
-        self.time_id_fp = 0         # Forward Pass
-        self.cpu_time_start_fp = 0
-        self.cpu_time_end_fp = 0
-        self.per_iter_fp_cpu_time = 0.0
-        self.gpu_time_start_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_fp_gpu_time = 0.0
-
-        self.time_id_bp = 0         # Backard Pass
-        self.cpu_time_start_bp = 0
-        self.cpu_time_end_bp = 0
-        self.per_iter_bp_cpu_time = 0.0
-        self.gpu_time_start_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_bp_gpu_time = 0.0
-
-        # Allreduce Gradient
-        self.cpu_time_start_ag = 0
-        self.cpu_time_end_ag = 0
-        self.per_iter_ag_cpu_time = 0.0
-        self.gpu_time_start_ag = torch.cuda.Event(enable_timing=True)
-        self.gpu_time_end_ag = torch.cuda.Event(enable_timing=True)
-        self.per_iter_ag_gpu_time = 0.0
-
-        self.time_id_ra = 0         # Recv Activation
-        self.cpu_time_start_ra = 0
-        self.cpu_time_end_ra = 0
-        self.per_iter_ra_cpu_time = 0.0
-        self.gpu_time_start_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_ra_gpu_time = 0.0
-
-        self.time_id_sa = 0         # Send Activation
-        self.cpu_time_start_sa = 0
-        self.cpu_time_end_sa = 0
-        self.per_iter_sa_cpu_time = 0.0
-        self.gpu_time_start_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_sa_gpu_time = 0.0
-
-        self.time_id_rg = 0         # Recv Gradient
-        self.cpu_time_start_rg = 0
-        self.cpu_time_end_rg = 0
-        self.per_iter_rg_cpu_time = 0.0
-        self.gpu_time_start_rg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_rg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_rg_gpu_time = 0.0
+        self.time_id = { v:0 for (k,v) in self._CMD_MAP.items() }         
+        self.cpu_time_start = { v:[ 0 for _ in range(self.gradient_accumulation_steps()) ] for (k,v) in self._CMD_MAP.items() }
+        self.cpu_time_end = { v:[ 0 for _ in range(self.gradient_accumulation_steps()) ] for (k,v) in self._CMD_MAP.items() }
+        self.gpu_time_start = { v:[ torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps()) ] for (k,v) in self._CMD_MAP.items() }
+        self.gpu_time_end = { v:[ torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps()) ] for (k,v) in self._CMD_MAP.items() }
 
         
-        self.time_id_sg = 0         # Send Gradient
-        self.cpu_time_start_sg = 0
-        self.cpu_time_end_sg = 0
-        self.per_iter_sg_cpu_time = 0.0
-        self.gpu_time_start_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.gpu_time_end_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
-        self.per_iter_sg_gpu_time = 0.0
+        # self.time_id_lmb = 0        # Load Micro Batch
+        # self.cpu_time_start_lmb = 0
+        # self.cpu_time_end_lmb = 0
+        # self.per_iter_lmb_cpu_time = 0.0
 
-        # Optimizer Step
-        self.cpu_time_start_os = 0
-        self.cpu_time_end_os = 0
-        self.per_iter_os_cpu_time = 0.0
-        self.gpu_time_start_os = torch.cuda.Event(enable_timing=True)
-        self.gpu_time_end_os = torch.cuda.Event(enable_timing=True)
-        self.per_iter_os_gpu_time = 0.0
+
+    
+        # self.time_id_fp = 0         # Forward Pass
+        # self.cpu_time_start_fp = 0
+        # self.cpu_time_end_fp = 0
+        # self.per_iter_fp_cpu_time = 0.0
+        # self.gpu_time_start_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_fp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_fp_gpu_time = 0.0
+
+        # self.time_id_bp = 0         # Backard Pass
+        # self.cpu_time_start_bp = 0
+        # self.cpu_time_end_bp = 0
+        # self.per_iter_bp_cpu_time = 0.0
+        # self.gpu_time_start_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_bp = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_bp_gpu_time = 0.0
+
+        # # Allreduce Gradient
+        # self.cpu_time_start_ag = 0
+        # self.cpu_time_end_ag = 0
+        # self.per_iter_ag_cpu_time = 0.0
+        # self.gpu_time_start_ag = torch.cuda.Event(enable_timing=True)
+        # self.gpu_time_end_ag = torch.cuda.Event(enable_timing=True)
+        # self.per_iter_ag_gpu_time = 0.0
+
+        # self.time_id_ra = 0         # Recv Activation
+        # self.cpu_time_start_ra = 0
+        # self.cpu_time_end_ra = 0
+        # self.per_iter_ra_cpu_time = 0.0
+        # self.gpu_time_start_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_ra = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_ra_gpu_time = 0.0
+
+        # self.time_id_sa = 0         # Send Activation
+        # self.cpu_time_start_sa = 0
+        # self.cpu_time_end_sa = 0
+        # self.per_iter_sa_cpu_time = 0.0
+        # self.gpu_time_start_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_sa = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_sa_gpu_time = 0.0
+
+        # self.time_id_rg = 0         # Recv Gradient
+        # self.cpu_time_start_rg = 0
+        # self.cpu_time_end_rg = 0
+        # self.per_iter_rg_cpu_time = 0.0
+        # self.gpu_time_start_rg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_rg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_rg_gpu_time = 0.0
+
+        
+        # self.time_id_sg = 0         # Send Gradient
+        # self.cpu_time_start_sg = 0
+        # self.cpu_time_end_sg = 0
+        # self.per_iter_sg_cpu_time = 0.0
+        # self.gpu_time_start_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.gpu_time_end_sg = [torch.cuda.Event(enable_timing=True) for _ in range(self.gradient_accumulation_steps())]
+        # self.per_iter_sg_gpu_time = 0.0
+
+        # # Optimizer Step
+        # self.cpu_time_start_os = 0
+        # self.cpu_time_end_os = 0
+        # self.per_iter_os_cpu_time = 0.0
+        # self.gpu_time_start_os = torch.cuda.Event(enable_timing=True)
+        # self.gpu_time_end_os = torch.cuda.Event(enable_timing=True)
+        # self.per_iter_os_gpu_time = 0.0
 
 
     def set_has_attention_mask(self, value):
@@ -444,9 +502,6 @@ class SFMPipeEngine(DeepSpeedEngine):
 
     def _exec_reduce_grads(self):
         
-        self.cpu_time_start_ag = time.perf_counter()
-        self.gpu_time_start_ag.record()
-
         self._force_grad_boundary = True
         if self.pipeline_enable_backward_allreduce:
             if self.using_bf16_optimizer:
@@ -456,8 +511,6 @@ class SFMPipeEngine(DeepSpeedEngine):
                 self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
         self._force_grad_boundary = False
 
-        self.gpu_time_end_ag.record()
-        self.cpu_time_end_ag = time.perf_counter()
 
     def _bf16_reduce_grads(self):
         # Make our own list of gradients from the optimizer's FP32 grads
@@ -497,7 +550,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         self.pipe_partition_grad_meta_cache = None
         self.grad_partition_grad_layer_meta_cache = None
 
-    def train_batch(self, data_iter=None):
+    def train_batch(self, data_iter=None, reset_act_each_step=False):
         """Progress the pipeline to train the next batch of data. The engine will ingest
         ``self.train_batch_size()`` total samples collectively across all workers.
 
@@ -610,66 +663,85 @@ class SFMPipeEngine(DeepSpeedEngine):
                 ]
             )
 
-        per_iter_avg_lmb_cpu_time = 0 if self.time_id_lmb == 0 else 1000 * self.per_iter_lmb_cpu_time/self.time_id_lmb
 
-        per_iter_avg_fp_cpu_time = 0 if self.time_id_fp == 0 else  1000 * self.per_iter_fp_cpu_time/self.time_id_fp
-        self.per_iter_fp_gpu_time = [self.gpu_time_start_fp[i].elapsed_time(self.gpu_time_end_fp[i]) for i in range(self.time_id_fp)] 
-        per_iter_avg_fp_gpu_time = 0 if self.time_id_fp == 0 else sum(self.per_iter_fp_gpu_time)/self.time_id_fp
+        self.time_id = { v:0 for (k,v) in self._CMD_MAP.items() }
+        cpuWritten = f"{self.global_steps} "
+        gpuWritten = f"{self.global_steps} "
+        for op in self.phase:
+            if op == '--':
+                cpuWritten += f"{op} "
+                gpuWritten += f"{op} "
+            else:
+                micro_batch = self.time_id[op]
 
-        per_iter_avg_bp_cpu_time = 0 if self.time_id_bp == 0 else  1000 * self.per_iter_bp_cpu_time/self.time_id_bp
-        self.per_iter_bp_gpu_time = [self.gpu_time_start_bp[i].elapsed_time(self.gpu_time_end_bp[i]) for i in range(self.time_id_bp)] 
-        per_iter_avg_bp_gpu_time = 0 if self.time_id_bp == 0 else sum(self.per_iter_bp_gpu_time)/self.time_id_bp
+                cpu_time = 1000 * (self.cpu_time_end[op][micro_batch] - self.cpu_time_start[op][micro_batch])
+                gpu_time = self.gpu_time_start[op][micro_batch].elapsed_time(self.gpu_time_end[op][micro_batch])
+                cpuWritten += f"{op}-c:{cpu_time:.2f} "
+                gpuWritten += f"{op}-g:{gpu_time:.2f} "
+                self.time_id[op] += 1
+        cpuWritten += f"\n"
+        gpuWritten += f"\n"
+        # per_iter_avg_lmb_cpu_time = 0 if self.time_id_lmb == 0 else 1000 * self.per_iter_lmb_cpu_time/self.time_id_lmb
 
-        per_iter_avg_ra_cpu_time = 0 if self.time_id_ra == 0 else  1000 * self.per_iter_ra_cpu_time/self.time_id_ra
-        self.per_iter_ra_gpu_time = [self.gpu_time_start_ra[i].elapsed_time(self.gpu_time_end_ra[i]) for i in range(self.time_id_ra)] 
-        per_iter_avg_ra_gpu_time = 0 if self.time_id_ra == 0 else sum(self.per_iter_ra_gpu_time)/self.time_id_ra
+        # per_iter_avg_fp_cpu_time = 0 if self.time_id_fp == 0 else  1000 * self.per_iter_fp_cpu_time/self.time_id_fp
+        # self.per_iter_fp_gpu_time = [self.gpu_time_start_fp[i].elapsed_time(self.gpu_time_end_fp[i]) for i in range(self.time_id_fp)] 
+        # per_iter_avg_fp_gpu_time = 0 if self.time_id_fp == 0 else sum(self.per_iter_fp_gpu_time)/self.time_id_fp
 
-        per_iter_avg_sa_cpu_time = 0 if self.time_id_sa == 0 else  1000 * self.per_iter_sa_cpu_time/self.time_id_sa
-        self.per_iter_sa_gpu_time = [self.gpu_time_start_sa[i].elapsed_time(self.gpu_time_end_sa[i]) for i in range(self.time_id_sa)] 
-        per_iter_avg_sa_gpu_time = 0 if self.time_id_sa == 0 else sum(self.per_iter_sa_gpu_time)/self.time_id_sa
+        # per_iter_avg_bp_cpu_time = 0 if self.time_id_bp == 0 else  1000 * self.per_iter_bp_cpu_time/self.time_id_bp
+        # self.per_iter_bp_gpu_time = [self.gpu_time_start_bp[i].elapsed_time(self.gpu_time_end_bp[i]) for i in range(self.time_id_bp)] 
+        # per_iter_avg_bp_gpu_time = 0 if self.time_id_bp == 0 else sum(self.per_iter_bp_gpu_time)/self.time_id_bp
+
+        # per_iter_avg_ra_cpu_time = 0 if self.time_id_ra == 0 else  1000 * self.per_iter_ra_cpu_time/self.time_id_ra
+        # self.per_iter_ra_gpu_time = [self.gpu_time_start_ra[i].elapsed_time(self.gpu_time_end_ra[i]) for i in range(self.time_id_ra)] 
+        # per_iter_avg_ra_gpu_time = 0 if self.time_id_ra == 0 else sum(self.per_iter_ra_gpu_time)/self.time_id_ra
+
+        # per_iter_avg_sa_cpu_time = 0 if self.time_id_sa == 0 else  1000 * self.per_iter_sa_cpu_time/self.time_id_sa
+        # self.per_iter_sa_gpu_time = [self.gpu_time_start_sa[i].elapsed_time(self.gpu_time_end_sa[i]) for i in range(self.time_id_sa)] 
+        # per_iter_avg_sa_gpu_time = 0 if self.time_id_sa == 0 else sum(self.per_iter_sa_gpu_time)/self.time_id_sa
         
-        per_iter_avg_rg_cpu_time = 0 if self.time_id_rg == 0 else  1000 * self.per_iter_rg_cpu_time/self.time_id_rg
-        self.per_iter_rg_gpu_time = [self.gpu_time_start_rg[i].elapsed_time(self.gpu_time_end_rg[i]) for i in range(self.time_id_rg)] 
-        per_iter_avg_rg_gpu_time = 0 if self.time_id_rg == 0 else sum(self.per_iter_rg_gpu_time)/self.time_id_rg
+        # per_iter_avg_rg_cpu_time = 0 if self.time_id_rg == 0 else  1000 * self.per_iter_rg_cpu_time/self.time_id_rg
+        # self.per_iter_rg_gpu_time = [self.gpu_time_start_rg[i].elapsed_time(self.gpu_time_end_rg[i]) for i in range(self.time_id_rg)] 
+        # per_iter_avg_rg_gpu_time = 0 if self.time_id_rg == 0 else sum(self.per_iter_rg_gpu_time)/self.time_id_rg
 
-        per_iter_avg_sg_cpu_time = 0 if self.time_id_sg == 0 else  1000 * self.per_iter_sg_cpu_time/self.time_id_sg
-        self.per_iter_sg_gpu_time = [self.gpu_time_start_sg[i].elapsed_time(self.gpu_time_end_sg[i]) for i in range(self.time_id_sg)] 
-        per_iter_avg_sg_gpu_time = 0 if self.time_id_sg == 0 else sum(self.per_iter_sg_gpu_time)/self.time_id_sg
+        # per_iter_avg_sg_cpu_time = 0 if self.time_id_sg == 0 else  1000 * self.per_iter_sg_cpu_time/self.time_id_sg
+        # self.per_iter_sg_gpu_time = [self.gpu_time_start_sg[i].elapsed_time(self.gpu_time_end_sg[i]) for i in range(self.time_id_sg)] 
+        # per_iter_avg_sg_gpu_time = 0 if self.time_id_sg == 0 else sum(self.per_iter_sg_gpu_time)/self.time_id_sg
 
-        per_iter_ag_cpu_time = 1000 * (self.cpu_time_end_ag - self.cpu_time_start_ag)
-        per_iter_ag_gpu_time = self.gpu_time_start_ag.elapsed_time(self.gpu_time_end_ag)
+        # per_iter_ag_cpu_time = 1000 * (self.cpu_time_end_ag - self.cpu_time_start_ag)
+        # per_iter_ag_gpu_time = self.gpu_time_start_ag.elapsed_time(self.gpu_time_end_ag)
 
-        per_iter_os_cpu_time = 1000 * (self.cpu_time_end_os - self.cpu_time_start_os)
-        per_iter_os_gpu_time = self.gpu_time_start_os.elapsed_time(self.gpu_time_end_os)
+        # per_iter_os_cpu_time = 1000 * (self.cpu_time_end_os - self.cpu_time_start_os)
+        # per_iter_os_gpu_time = self.gpu_time_start_os.elapsed_time(self.gpu_time_end_os)
 
-        strWritten = f"Step:{self.global_steps} LMB:{per_iter_avg_lmb_cpu_time:.2f} RA-c:{per_iter_avg_ra_cpu_time:.2f} RA-g:{per_iter_avg_ra_gpu_time:.2f} FP-c:{per_iter_avg_fp_cpu_time:.2f} FP-g:{per_iter_avg_fp_gpu_time:.2f} SA-c:{per_iter_avg_sa_cpu_time:.2f} SA-g:{per_iter_avg_sa_gpu_time:.2f} RG-c:{per_iter_avg_rg_cpu_time:.2f} RG-g:{per_iter_avg_rg_gpu_time:.2f} BP-c:{per_iter_avg_bp_cpu_time:.2f} BP-g:{per_iter_avg_bp_gpu_time:.2f} SG-c:{per_iter_avg_sg_cpu_time:.2f} SG-g:{per_iter_avg_sg_gpu_time:.2f} AG-c:{per_iter_ag_cpu_time:.2f} AG-g:{per_iter_ag_gpu_time:.2f} OS-c:{per_iter_os_cpu_time:.2f} OS-g:{per_iter_os_gpu_time:.2f} \n"
+        # strWritten = f"Step:{self.global_steps} LMB:{per_iter_avg_lmb_cpu_time:.2f} RA-c:{per_iter_avg_ra_cpu_time:.2f} RA-g:{per_iter_avg_ra_gpu_time:.2f} FP-c:{per_iter_avg_fp_cpu_time:.2f} FP-g:{per_iter_avg_fp_gpu_time:.2f} SA-c:{per_iter_avg_sa_cpu_time:.2f} SA-g:{per_iter_avg_sa_gpu_time:.2f} RG-c:{per_iter_avg_rg_cpu_time:.2f} RG-g:{per_iter_avg_rg_gpu_time:.2f} BP-c:{per_iter_avg_bp_cpu_time:.2f} BP-g:{per_iter_avg_bp_gpu_time:.2f} SG-c:{per_iter_avg_sg_cpu_time:.2f} SG-g:{per_iter_avg_sg_gpu_time:.2f} AG-c:{per_iter_ag_cpu_time:.2f} AG-g:{per_iter_ag_gpu_time:.2f} OS-c:{per_iter_os_cpu_time:.2f} OS-g:{per_iter_os_gpu_time:.2f} \n"
         
         #print(strWritten)
-        self.file.write(strWritten)
+        self.file.write(cpuWritten)
+        self.file.write(gpuWritten)
         self.file.flush()
 
 
-        self.per_iter_lmb_cpu_time = 0.0
-        self.per_iter_fp_cpu_time = 0.0
-        self.per_iter_fp_gpu_time = 0.0
-        self.per_iter_bp_cpu_time = 0.0
-        self.per_iter_bp_gpu_time = 0.0
-        self.per_iter_ra_cpu_time = 0.0
-        self.per_iter_ra_gpu_time = 0.0
-        self.per_iter_sa_cpu_time = 0.0
-        self.per_iter_sa_gpu_time = 0.0
-        self.per_iter_rg_cpu_time = 0.0
-        self.per_iter_rg_gpu_time = 0.0
-        self.per_iter_sg_cpu_time = 0.0
-        self.per_iter_sa_gpu_time = 0.0
+        # self.per_iter_lmb_cpu_time = 0.0
+        # self.per_iter_fp_cpu_time = 0.0
+        # self.per_iter_fp_gpu_time = 0.0
+        # self.per_iter_bp_cpu_time = 0.0
+        # self.per_iter_bp_gpu_time = 0.0
+        # self.per_iter_ra_cpu_time = 0.0
+        # self.per_iter_ra_gpu_time = 0.0
+        # self.per_iter_sa_cpu_time = 0.0
+        # self.per_iter_sa_gpu_time = 0.0
+        # self.per_iter_rg_cpu_time = 0.0
+        # self.per_iter_rg_gpu_time = 0.0
+        # self.per_iter_sg_cpu_time = 0.0
+        # self.per_iter_sa_gpu_time = 0.0
 
-        self.time_id_lmb = 0
-        self.time_id_fp = 0
-        self.time_id_bp = 0
-        self.time_id_ra = 0
-        self.time_id_sa = 0
-        self.time_id_rg = 0
-        self.time_id_sg = 0
+        # self.time_id_lmb = 0
+        # self.time_id_fp = 0
+        # self.time_id_bp = 0
+        # self.time_id_ra = 0
+        # self.time_id_sa = 0
+        # self.time_id_rg = 0
+        # self.time_id_sg = 0
 
         # TODO: should return precisely what loss returned and allow others to be queried?
         return self.agg_train_loss
@@ -1012,15 +1084,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         # # tensor changes across batches
         # self._zero_grads(inputs)
 
-        self.cpu_time_start_fp = time.perf_counter()
-        self.gpu_time_start_fp[self.time_id_fp].record()
-        outputs = super().forward(inputs)
-        self.gpu_time_end_fp[self.time_id_fp].record()
-        self.cpu_time_end_fp = time.perf_counter()
-        self.per_iter_fp_cpu_time += self.cpu_time_end_fp - self.cpu_time_start_fp
-
-        self.time_id_fp += 1
-        
+        outputs = super().forward(inputs)     
 
         # Reset activation checkpointing buffers.
         # Need to call this between evaluation iterations
@@ -1115,13 +1179,7 @@ class SFMPipeEngine(DeepSpeedEngine):
 
         if self.is_last_stage():
             
-            self.cpu_time_start_bp = time.perf_counter()
-            self.gpu_time_start_bp[self.time_id_bp].record()
             super().backward(self.loss)
-            self.gpu_time_end_bp[self.time_id_bp].record()
-            self.cpu_time_end_bp = time.perf_counter()
-            self.per_iter_bp_cpu_time += self.cpu_time_end_bp - self.cpu_time_start_bp
-            self.time_id_bp += 1
 
             self.mem_status("AFTER BWD")
             return
@@ -1170,8 +1228,6 @@ class SFMPipeEngine(DeepSpeedEngine):
             # manually call because we don't call optimizer.backward()
             self.optimizer.clear_lp_grads()
 
-        self.cpu_time_start_bp = time.perf_counter()
-        self.gpu_time_start_bp[self.time_id_bp].record()
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
             # print("length of outputs:", len(outputs))
@@ -1185,11 +1241,6 @@ class SFMPipeEngine(DeepSpeedEngine):
         else:
             torch.autograd.backward(tensors=(outputs,), grad_tensors=(grad_tensors,))
         
-        self.gpu_time_end_bp[self.time_id_bp].record()
-        self.cpu_time_end_bp = time.perf_counter()
-        self.per_iter_bp_cpu_time += self.cpu_time_end_bp - self.cpu_time_start_bp
-
-        self.time_id_bp += 1
 
         if self.using_bf16_optimizer and not self.is_last_stage():
             # manually call because we don't call optimizer.backward()
@@ -1227,8 +1278,6 @@ class SFMPipeEngine(DeepSpeedEngine):
             return inputs
 
     def _exec_load_micro_batch(self, buffer_id):
-
-        self.cpu_time_start_lmb = time.perf_counter()
         
         if self.wall_clock_breakdown():
             self.timers("batch_input").start()
@@ -1279,10 +1328,6 @@ class SFMPipeEngine(DeepSpeedEngine):
 
         if self.wall_clock_breakdown():
             self.timers(BATCH_INPUT_TIMER).stop()
-
-        self.cpu_time_end_lmb = time.perf_counter()
-        self.per_iter_lmb_cpu_time += self.cpu_time_end_lmb - self.cpu_time_start_lmb
-        self.time_id_lmb += 1
         
 
     def _send_tensor_meta(self, buffer, recv_stage):
@@ -1295,21 +1340,47 @@ class SFMPipeEngine(DeepSpeedEngine):
                 * ndims
                 * shape
         """
+        torch.cuda.nvtx.range_push("4.1")
         send_bytes = 0
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("4.2")
         if isinstance(buffer, torch.Tensor):
+            torch.cuda.nvtx.range_push("4.2.1.1")
             type_tensor = torch.LongTensor(data=[0]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.2")
             p2p.send(type_tensor, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.3")
             send_shape = torch.LongTensor(data=buffer.size()).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.4")
             send_ndims = torch.LongTensor(data=[len(buffer.size())]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.5")
             p2p.send(send_ndims, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.6")
             p2p.send(send_shape, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.1.7")
             send_bytes += _tensor_bytes(buffer)
+            torch.cuda.nvtx.range_pop()
         elif isinstance(buffer, list):
             # assert (False)
+            torch.cuda.nvtx.range_push("4.2.2.1")
             type_tensor = torch.LongTensor(data=[1]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.2.2")
             p2p.send(type_tensor, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.2.3")
             count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.2.4")
             p2p.send(count_tensor, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.2.5")
             for tensor in buffer:
                 assert isinstance(tensor, torch.Tensor)
                 send_shape = torch.LongTensor(data=tensor.size()).to(self.device)
@@ -1317,11 +1388,21 @@ class SFMPipeEngine(DeepSpeedEngine):
                 p2p.send(send_ndims, recv_stage)
                 p2p.send(send_shape, recv_stage)
                 send_bytes += _tensor_bytes(tensor)
+            torch.cuda.nvtx.range_pop()
         elif isinstance(buffer, tuple):
+            torch.cuda.nvtx.range_push("4.2.3.1")
             type_tensor = torch.LongTensor(data=[2]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.3.2")
             p2p.send(type_tensor, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.3.3")
             count_tensor = torch.LongTensor(data=[len(buffer)]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.3.4")
             p2p.send(count_tensor, recv_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.3.5")
             # print("send", type_tensor, count_tensor, recv_stage)
             for idx, tensor in enumerate(buffer):
                 assert isinstance(tensor, torch.Tensor)
@@ -1344,6 +1425,7 @@ class SFMPipeEngine(DeepSpeedEngine):
                         f'STAGE={self.stage_id} pipe-send-volume[{idx}]: shape={send_shape} {new_bytes/1024**2:0.2f}MB'
                     )
                 """
+            torch.cuda.nvtx.range_pop()
         else:
             raise NotImplementedError(f"Could not send meta type {type(buffer)}")
 
@@ -1352,6 +1434,7 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.grid.data_parallel_id == 0:
             print(f'STAGE={self.stage_id} pipe-send-volume: {send_bytes/1024**2:0.2f}MB')
         """
+        torch.cuda.nvtx.range_pop()
 
     def _recv_tensor_meta(self, send_stage):
         """Receive metadata about upcoming p2p transfers and return allocated buffers.
@@ -1366,28 +1449,61 @@ class SFMPipeEngine(DeepSpeedEngine):
         Returns:
             Allocated buffer for receiving from send_stage.
         """
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3.1")
         type_tensor = torch.LongTensor(data=[0]).to(self.device)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3.2")
         p2p.recv(type_tensor, send_stage)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3.3")
         recv_type = type_tensor.item()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3.4")
         # print("recv", type_tensor, send_stage, recv_type)
         # A single tensor will be sent.
         if recv_type == 0:
+            torch.cuda.nvtx.range_push("3.4.1.1")
             recv_ndims = torch.LongTensor(data=[0]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.2")
             p2p.recv(recv_ndims, send_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.3")
             recv_ndims = recv_ndims.item()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.4")
             recv_shape = torch.LongTensor([1] * recv_ndims).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.5")
             p2p.recv(recv_shape, send_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.6")
             recv_shape = recv_shape.tolist()
-            return self._allocate_buffer(recv_shape, num_buffers=1)[0]
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.1.7")
+            res = self._allocate_buffer(recv_shape, num_buffers=1)[0]
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()
+
+            return res
 
         # List or tuple of tensors
         elif recv_type == 1 or recv_type == 2:
+            torch.cuda.nvtx.range_push("3.4.2.1")
             count_tensor = torch.LongTensor(data=[0]).to(self.device)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.2")
             p2p.recv(count_tensor, send_stage)
             # print(count_tensor, send_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.3")
             num_tensors = count_tensor.item()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.4")
             recv_shapes_and_dtypes = []
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.5")
             for idx in range(num_tensors):
                 recv_dtype = torch.LongTensor(data=[0]).to(self.device)
                 p2p.recv(recv_dtype, send_stage)
@@ -1399,66 +1515,74 @@ class SFMPipeEngine(DeepSpeedEngine):
                 p2p.recv(recv_shape, send_stage)
                 recv_shapes_and_dtypes.append((recv_shape.tolist(), recv_dtype))
                 # print(recv_dtype, recv_ndims, recv_shape, send_stage)
-
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.6")
             buffers = self._allocate_buffers(recv_shapes_and_dtypes, num_buffers=1)[0]
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("3.4.2.7")
             # Convert to tuples if requested.
             if recv_type == 2:
                 buffers = tuple(buffers)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()
             return buffers
 
         else:
             raise NotImplementedError(f"Could not receive type {type(recv_type)}")
+        torch.cuda.nvtx.range_pop()
 
     def _exec_send_activations(self, buffer_id):
-        self.cpu_time_start_sa = time.perf_counter()
-        self.gpu_time_start_sa[self.time_id_sa].record()
 
+        torch.cuda.nvtx.range_push("1")
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).start()
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("2")
         outputs = self.pipe_buffers["outputs"][buffer_id]
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3")
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
         # messages (TODO)
+        
         if self.has_attention_mask or self.has_bool_tensors:
             outputs = list(outputs)
             outputs[-1] = outputs[-1].half()
             outputs = tuple(outputs)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("4")
         # print("first_output_send", self.first_output_send)
         if self.first_output_send:
             # self.first_output_send = False
             self._send_tensor_meta(outputs, self.next_stage)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("5")
         if isinstance(outputs, torch.Tensor):
             p2p.send(outputs, self.next_stage)
         elif isinstance(outputs, tuple):
+            torch.cuda.nvtx.range_push("5.1")
             for idx, buffer in enumerate(outputs):
                 p2p.send(buffer, self.next_stage)
+            torch.cuda.nvtx.range_pop()
         else:
             raise NotImplementedError(
                 "Could not send output of type" f"{type(outputs)}"
             )
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("6")
         # Restore the boolean tensor
         if self.has_attention_mask or self.has_bool_tensors:
             outputs = list(outputs)
             outputs[-1] = outputs[-1].bool()
             outputs = tuple(outputs)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("7")
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_OUTPUT_TIMER).stop()
-
-        self.gpu_time_end_sa[self.time_id_sa].record()
-        self.cpu_time_end_sa = time.perf_counter()
-        self.per_iter_sa_cpu_time += self.cpu_time_end_sa - self.cpu_time_start_sa
-        self.time_id_sa += 1
+        torch.cuda.nvtx.range_pop()
 
     def _exec_send_grads(self, buffer_id):
 
-        self.cpu_time_start_sg = time.perf_counter()
-        self.gpu_time_start_sg[self.time_id_sg].record()
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).start()
 
@@ -1517,31 +1641,40 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_SEND_GRAD_TIMER).stop()
 
-        self.gpu_time_end_sg[self.time_id_sg].record()
-        self.cpu_time_end_sg = time.perf_counter()
-        self.per_iter_sg_cpu_time += self.cpu_time_end_sg - self.cpu_time_start_sg
-        self.time_id_sg += 1
 
     def _exec_recv_activations(self, buffer_id):
 
-        self.cpu_time_start_ra = time.perf_counter()
-        self.gpu_time_start_ra[self.time_id_ra].record()
+        torch.cuda.nvtx.range_push("1")
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).start()
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("2")
         recvd = None
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("3")
         # Allocate the buffer if necessary
         if self.pipe_recv_buf is None:
             self.pipe_recv_buf = self._recv_tensor_meta(self.prev_stage)
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("4")
         if isinstance(self.pipe_recv_buf, torch.Tensor):
+            torch.cuda.nvtx.range_push("4.1.1")
             p2p.recv(self.pipe_recv_buf, self.prev_stage)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.1.2")
             recvd = self.pipe_recv_buf.clone().detach()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.1.3")
             recvd.requires_grad = recvd.is_floating_point()
+            torch.cuda.nvtx.range_pop()
         else:
+            torch.cuda.nvtx.range_push("4.2.1")
             assert isinstance(self.pipe_recv_buf, tuple)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.2")
             recvd = [None] * len(self.pipe_recv_buf)
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.3")
             for idx, buffer in enumerate(self.pipe_recv_buf):
                 assert torch.is_tensor(buffer)
                 # XXX hardcode meta type
@@ -1554,32 +1687,35 @@ class SFMPipeEngine(DeepSpeedEngine):
 
                 p2p.recv(buffer, self.prev_stage)
                 recvd[idx] = buffer.clone().detach()
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.4")
             # NCCL does not like to send torch.BoolTensor types, so un-cast the
             # attention mask
             if self.has_attention_mask or self.has_bool_tensors:
                 recvd[-1] = recvd[-1].bool()
-
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.5")
             recvd = tuple(recvd)
-
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("4.2.6")
             for buffer in recvd:
                 buffer.requires_grad = buffer.is_floating_point()
+            torch.cuda.nvtx.range_pop()
         
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("5")
         self.pipe_buffers["inputs"][buffer_id] = recvd
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("6")
         self.pipe_recv_buf = None
         # self.meta_buffer = None
-
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("7")
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_INPUT_TIMER).stop()
-
-        self.gpu_time_end_ra[self.time_id_ra].record()
-        self.cpu_time_end_ra = time.perf_counter()
-        self.per_iter_ra_cpu_time += self.cpu_time_end_ra - self.cpu_time_start_ra
-        self.time_id_ra += 1
+        torch.cuda.nvtx.range_pop()
 
     def _exec_recv_grads(self, buffer_id):
-        self.cpu_time_start_rg = time.perf_counter()
-        self.gpu_time_start_rg[self.time_id_rg].record()
         
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).start()
@@ -1655,11 +1791,6 @@ class SFMPipeEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
 
-        self.gpu_time_end_rg[self.time_id_rg].record()
-
-        self.cpu_time_end_rg = time.perf_counter()
-        self.per_iter_rg_cpu_time += self.cpu_time_end_rg - self.cpu_time_start_rg
-        self.time_id_rg += 1
 
 
     def _exec_optimizer_step(self, lr_kwargs=None):
@@ -1668,13 +1799,9 @@ class SFMPipeEngine(DeepSpeedEngine):
             self.timers(STEP_GLOBAL_TIMER).start()
         self.mem_status("BEFORE STEP", reset_max=True)
         
-        self.cpu_time_start_os = time.perf_counter()
-        self.gpu_time_start_os.record()
         self._force_grad_boundary = True
         self._take_model_step(lr_kwargs)
         self._force_grad_boundary = False
-        self.gpu_time_end_os.record()
-        self.cpu_time_end_os = time.perf_counter()
         
         self.mem_status("AFTER STEP")
 
@@ -2164,8 +2291,11 @@ class SFMPipeEngine(DeepSpeedEngine):
         # Reserve and reset buffers.
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         self.fwd_outputs = []
-
+        #import pdb
+        #if self.local_rank == 0:
+        #    pdb.set_trace()
         # For each step in the schedule
+        self.time_id = { v:0 for (k,v) in self._CMD_MAP.items() }  
         for step_cmds in pipe_schedule:
             # For each instruction in the step
             for cmd in step_cmds:
@@ -2178,20 +2308,19 @@ class SFMPipeEngine(DeepSpeedEngine):
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
                 #self._exec_instr(**cmd.kwargs)
+                op = self._CMD_MAP[type(cmd)]
+                micro_batch = self.time_id[op]
+                self.cpu_time_start[op][micro_batch] = time.perf_counter()
+                self.gpu_time_start[op][micro_batch].record()
 
                 torch.cuda.nvtx.range_push(str(cmd))
-                #commands.append(str(cmd))
-                #start = time.perf_counter()
                 self._exec_instr(**cmd.kwargs)
-                #end = time.perf_counter()
-                # if str(cmd) in cpu_times:
-                #     cpu_times[str(cmd)] += (end-start)
-                # else:
-                #cpu_times[str(cmd)] = (end-start)
                 torch.cuda.nvtx.range_pop()
 
-        #print("Local rank: " + str(self.local_rank) + " " + str(cpu_times))
+                self.gpu_time_end[op][micro_batch].record()
+                self.cpu_time_end[op][micro_batch] = time.perf_counter()
 
+                self.time_id[op] += 1
 
     ## all follows are added functions
     @instrument_w_nvtx
